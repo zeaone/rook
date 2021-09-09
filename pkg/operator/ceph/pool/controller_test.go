@@ -33,6 +33,8 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/tevino/abool"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -347,6 +349,42 @@ func TestCephBlockPoolController(t *testing.T) {
 		blockPoolChannels: make(map[string]*blockPoolHealth),
 	}
 
+	os.Setenv("POD_NAME", "test")
+	defer os.Setenv("POD_NAME", "")
+	os.Setenv("POD_NAMESPACE", namespace)
+	defer os.Setenv("POD_NAMESPACE", "")
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "ReplicaSet",
+					Name: "testReplicaSet",
+				},
+			},
+		},
+	}
+	// Create fake pod
+	_, err = r.context.Clientset.CoreV1().Pods(namespace).Create(context.TODO(), p, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testReplicaSet",
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "Deployment",
+				},
+			},
+		},
+	}
+
+	// Create fake replicaset
+	_, err = r.context.Clientset.AppsV1().ReplicaSets(namespace).Create(context.TODO(), replicaSet, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	pool.Spec.Mirroring.Mode = "image"
 	pool.Spec.Mirroring.Peers.SecretNames = []string{}
 	err = r.client.Update(context.TODO(), pool)
@@ -445,13 +483,16 @@ func TestConfigureRBDStats(t *testing.T) {
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			logger.Infof("Command: %s %v", command, args)
-			switch {
-			case args[0] == "config" && args[1] == "set" && args[2] == "mgr." && args[3] == "mgr/prometheus/rbd_stats_pools" && args[4] != "":
-				return "", nil
-			case args[0] == "config" && args[1] == "get" && args[2] == "mgr." && args[3] == "mgr/prometheus/rbd_stats_pools":
-				return "", nil
-			case args[0] == "config" && args[1] == "rm" && args[2] == "mgr." && args[3] == "mgr/prometheus/rbd_stats_pools":
-				return "", nil
+			if args[0] == "config" && args[2] == "mgr." && args[3] == "mgr/prometheus/rbd_stats_pools" {
+				if args[1] == "set" && args[4] != "" {
+					return "", nil
+				}
+				if args[1] == "get" {
+					return "", nil
+				}
+				if args[1] == "rm" {
+					return "", nil
+				}
 			}
 			return "", errors.Errorf("unexpected arguments %q", args)
 		},
@@ -509,7 +550,7 @@ func TestConfigureRBDStats(t *testing.T) {
 	context.Executor = &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			logger.Infof("Command: %s %v", command, args)
-			return "", errors.New("mock error to simulate failure of SetConfig() function")
+			return "", errors.New("mock error to simulate failure of mon store Set() function")
 		},
 	}
 	err = configureRBDStats(context, clusterInfo)

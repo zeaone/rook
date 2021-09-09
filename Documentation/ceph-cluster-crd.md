@@ -220,7 +220,7 @@ For more details on the mons and when to choose a number other than `3`, see the
   * [Storage Class Device Sets](#storage-class-device-sets)
   * `onlyApplyOSDPlacement`: Whether the placement specific for OSDs is merged with the `all` placement. If `false`, the OSD placement will be merged with the `all` placement. If true, the `OSD placement will be applied` and the `all` placement will be ignored. The placement for OSDs is computed from several different places depending on the type of OSD:
     - For non-PVCs: `placement.all` and `placement.osd`
-    - For PVCs: `placement.all` and inside the storageClassDeviceSet from the `placement` or `preparePlacement`
+    - For PVCs: `placement.all` and inside the storageClassDeviceSets from the `placement` or `preparePlacement`
   * `managePodBudgets`: if `true`, the operator will create and manage PodDisruptionBudgets for OSD, Mon, RGW, and MDS daemons. OSD PDBs are managed dynamically via the strategy outlined in the [design](https://github.com/rook/rook/blob/master/design/ceph/ceph-managed-disruptionbudgets.md). The operator will block eviction of OSDs by default and unblock them safely when drains are detected.
   * `osdMaintenanceTimeout`: is a duration in minutes that determines how long an entire failureDomain like `region/zone/host` will be held in `noout` (in addition to the default DOWN/OUT interval) when it is draining. This is only relevant when  `managePodBudgets` is `true`. The default value is `30` minutes.
   * `manageMachineDisruptionBudgets`: if `true`, the operator will create and manage MachineDisruptionBudgets to ensure OSDs are only fenced when the cluster is healthy. Only available on OpenShift.
@@ -247,7 +247,12 @@ A specific will contain a specific release of Ceph as well as security fixes fro
 
 ### Mon Settings
 
-* `count`: Set the number of mons to be started. The number must be odd and between `1` and `9`. If not specified the default is set to `3`.
+* `count`: Set the number of mons to be started. The number must be between `1` and `9`. The recommended value is most commonly `3`.
+  For highest availability, an odd number of mons should be specified.
+  For higher durability in case of mon loss, an even number can be specified although availability may be lower.
+  To maintain quorum a majority of mons must be up. For example, if there are three mons, two must be up.
+  If there are four mons, three must be up. If there are two mons, both must be up.
+  If quorum is lost, see the [disaster recovery guide](ceph-disaster-recovery.md#restoring-mon-quorum) to restore quorum from a single mon.
 * `allowMultiplePerNode`: Whether to allow the placement of multiple mons on a single node. Default is `false` for production. Should only be set to `true` in test environments.
 * `volumeClaimTemplate`: A `PersistentVolumeSpec` used by Rook to create PVCs
   for monitor storage. This field is optional, and when not provided, HostPath

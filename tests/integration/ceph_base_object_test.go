@@ -23,6 +23,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -48,11 +49,16 @@ var (
 	ObjectKey1             = "rookObj1"
 	ObjectKey2             = "rookObj2"
 	ObjectKey3             = "rookObj3"
+	ObjectKey4             = "rookObj4"
 	contentType            = "plain/text"
 	obcName                = "smoke-delete-bucket"
 	region                 = "us-east-1"
 	maxObject              = "2"
+	newMaxObject           = "3"
 	bucketStorageClassName = "rook-smoke-delete-bucket"
+	maxBucket              = 1
+	maxSize                = "100000"
+	userCap                = "read"
 )
 
 // Smoke Test for ObjectStore - Test check the following operations on ObjectStore in order
@@ -109,11 +115,11 @@ func objectStoreCleanUp(s suite.Suite, helper *clients.TestClient, k8sh *utils.K
 func createCephObjectUser(
 	s suite.Suite, helper *clients.TestClient, k8sh *utils.K8sHelper,
 	namespace, storeName, userID string,
-	checkPhase bool,
-) {
+	checkPhase, checkQuotaAndCaps bool) {
 	s.T().Helper()
-
-	cosuErr := helper.ObjectUserClient.Create(namespace, userID, userdisplayname, storeName)
+	maxObjectInt, err := strconv.Atoi(maxObject)
+	assert.Nil(s.T(), err)
+	cosuErr := helper.ObjectUserClient.Create(userID, userdisplayname, storeName, userCap, maxSize, maxBucket, maxObjectInt)
 	assert.Nil(s.T(), cosuErr)
 	logger.Infof("Waiting 5 seconds for the object user to be created")
 	time.Sleep(5 * time.Second)
@@ -123,13 +129,13 @@ func createCephObjectUser(
 		time.Sleep(5 * time.Second)
 	}
 
-	checkCephObjectUser(s, helper, k8sh, namespace, storeName, userID, checkPhase)
+	checkCephObjectUser(s, helper, k8sh, namespace, storeName, userID, checkPhase, checkQuotaAndCaps)
 }
 
 func checkCephObjectUser(
 	s suite.Suite, helper *clients.TestClient, k8sh *utils.K8sHelper,
 	namespace, storeName, userID string,
-	checkPhase bool,
+	checkPhase, checkQuotaAndCaps bool,
 ) {
 	s.T().Helper()
 
@@ -146,6 +152,17 @@ func checkCephObjectUser(
 		phase, err := k8sh.GetResource("--namespace", namespace, "cephobjectstoreuser", userID, "--output", "jsonpath={.status.phase}")
 		assert.NoError(s.T(), err)
 		assert.Equal(s.T(), k8sutil.ReadyStatus, phase)
+	}
+	if checkQuotaAndCaps {
+		// following fields in CephObjectStoreUser CRD doesn't exist before Rook v1.7
+		maxObjectInt, err := strconv.Atoi(maxObject)
+		assert.Nil(s.T(), err)
+		maxSizeInt, err := strconv.Atoi(maxSize)
+		assert.Nil(s.T(), err)
+		assert.Equal(s.T(), maxBucket, userInfo.MaxBuckets)
+		assert.Equal(s.T(), int64(maxObjectInt), *userInfo.UserQuota.MaxObjects)
+		assert.Equal(s.T(), int64(maxSizeInt), *userInfo.UserQuota.MaxSize)
+		assert.Equal(s.T(), userCap, userInfo.Caps[0].Perm)
 	}
 }
 
@@ -176,8 +193,8 @@ func testObjectStoreOperations(s suite.Suite, helper *clients.TestClient, k8sh *
 	ctx := context.TODO()
 	clusterInfo := client.AdminClusterInfo(namespace)
 	t := s.T()
-	t.Run("create CephObjectStoreUser", func(t *testing.T) {
-		createCephObjectUser(s, helper, k8sh, namespace, storeName, userid, true)
+	t.Run(fmt.Sprintf("create CephObjectStoreUser %q", storeName), func(t *testing.T) {
+		createCephObjectUser(s, helper, k8sh, namespace, storeName, userid, true, true)
 		i := 0
 		for i = 0; i < 4; i++ {
 			if helper.ObjectUserClient.UserSecretExists(namespace, storeName, userid) {
@@ -190,18 +207,21 @@ func testObjectStoreOperations(s suite.Suite, helper *clients.TestClient, k8sh *
 	})
 
 	// Check object store status
-	t.Run("verify CephObjectStore status", func(t *testing.T) {
+	t.Run(fmt.Sprintf("verify ceph object store %q status", storeName), func(t *testing.T) {
+		retryCount := 30
 		i := 0
-		for i = 0; i < 10; i++ {
+		for i = 0; i < retryCount; i++ {
 			objectStore, err := k8sh.RookClientset.CephV1().CephObjectStores(namespace).Get(ctx, storeName, metav1.GetOptions{})
 			assert.Nil(s.T(), err)
 			if objectStore.Status == nil || objectStore.Status.BucketStatus == nil {
-				logger.Infof("(%d) bucket status check sleeping for 5 seconds ...", i)
+				logger.Infof("(%d) object status check sleeping for 5 seconds ...%+v", i, objectStore.Status)
 				time.Sleep(5 * time.Second)
 				continue
 			}
 			logger.Info("objectstore status is", objectStore.Status)
 			if objectStore.Status.BucketStatus.Health == cephv1.ConditionFailure {
+				logger.Infof("(%d) bucket status check sleeping for 5 seconds ...%+v", i, objectStore.Status.BucketStatus)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 			assert.Equal(s.T(), cephv1.ConditionConnected, objectStore.Status.BucketStatus.Health)
@@ -210,7 +230,9 @@ func testObjectStoreOperations(s suite.Suite, helper *clients.TestClient, k8sh *
 			assert.NotEmpty(s.T(), objectStore.Status.Info["endpoint"])
 			break
 		}
-		assert.NotEqual(t, 10, i)
+		if i == retryCount {
+			t.Fatal("bucket status check failed. status is not connected")
+		}
 	})
 
 	context := k8sh.MakeContext()
@@ -280,10 +302,26 @@ func testObjectStoreOperations(s suite.Suite, helper *clients.TestClient, k8sh *
 			assert.Error(s.T(), poErr)
 		})
 
+		t.Run("test update quota on OBC bucket", func(t *testing.T) {
+			poErr := helper.BucketClient.UpdateObc(obcName, bucketStorageClassName, bucketname, newMaxObject, true)
+			assert.Nil(s.T(), poErr)
+			updated := utils.Retry(5, 2*time.Second, "OBC is updated", func() bool {
+				return helper.BucketClient.CheckOBMaxObject(obcName, newMaxObject)
+			})
+			assert.True(s.T(), updated)
+			logger.Infof("Testing the updated object limit")
+			_, poErr = s3client.PutObjectInBucket(bucketname, ObjBody, ObjectKey3, contentType)
+			assert.NoError(s.T(), poErr)
+			_, poErr = s3client.PutObjectInBucket(bucketname, ObjBody, ObjectKey4, contentType)
+			assert.Error(s.T(), poErr)
+		})
+
 		t.Run("delete objects on OBC bucket", func(t *testing.T) {
 			_, delobjErr := s3client.DeleteObjectInBucket(bucketname, ObjectKey1)
 			assert.Nil(s.T(), delobjErr)
 			_, delobjErr = s3client.DeleteObjectInBucket(bucketname, ObjectKey2)
+			assert.Nil(s.T(), delobjErr)
+			_, delobjErr = s3client.DeleteObjectInBucket(bucketname, ObjectKey3)
 			assert.Nil(s.T(), delobjErr)
 			logger.Info("Objects deleted on bucket successfully")
 		})
@@ -427,8 +465,8 @@ func generateRgwTlsCertSecret(s suite.Suite, helper *clients.TestClient, k8sh *u
 	tlscertdir, err := ioutil.TempDir(root, "tlscertdir")
 	require.NoError(s.T(), err, "failed to create directory for TLS certs")
 	defer os.RemoveAll(tlscertdir)
-	cmdArgs := utils.CommandArgs{Command: filepath.Join(root, "tests/scripts/github-action-helper.sh"),
-		CmdArgs: []string{"generate_tls_config", tlscertdir, rgwServiceName, namespace}}
+	cmdArgs := utils.CommandArgs{Command: filepath.Join(root, "tests/scripts/generate-tls-config.sh"),
+		CmdArgs: []string{tlscertdir, rgwServiceName, namespace}}
 	cmdOut := utils.ExecuteCommand(cmdArgs)
 	require.NoError(s.T(), cmdOut.Err)
 	tlsKeyIn, err := ioutil.ReadFile(filepath.Join(tlscertdir, rgwServiceName+".key"))
